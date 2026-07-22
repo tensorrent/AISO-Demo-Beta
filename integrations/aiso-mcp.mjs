@@ -3,20 +3,79 @@
 // =================================================================
 // Zero-dependency MCP (Model Context Protocol) stdio server for AISO.
 // =================================================================
+// build: demonstration — default target is the Demo-Beta stand-in on :8899.
+// NEVER treat :8899 as production. Production agents must set
+// AISO_PRODUCTION=1 (or AISO_MODE=production) and point AISO_URL at the real
+// engine base (POST /api/query with Bearer AISO_TOKEN).
+//
 // Exposes the AISO transparent-trust-engine HTTP contract as MCP tools, so any
 // MCP client — Antigravity, Gemini, Claude, Cursor — can auto-discover and call
-// it. It is a thin proxy: it forwards `reason`/`remember` to the AISO server's
-// /v1 API and returns the verdict.
-//
-// Run the AISO demo server first (node aiso-demo-server.mjs, default :8899), then
-// register THIS file as an MCP stdio server in your client. Point it at a
-// different AISO instance with AISO_URL (e.g. your production /v1 gateway).
+// it. It is a thin proxy: demo mode forwards to /v1; production mode to /api/query.
 //
 // Protocol: JSON-RPC 2.0, newline-delimited, over stdin/stdout (the MCP stdio
 // transport). No SDK, no npm install — Node 18+ (global fetch) is all it needs.
 
-const AISO_URL = (process.env.AISO_URL || "http://127.0.0.1:8899").replace(/\/$/, "");
 const PROTOCOL_VERSION = "2024-11-05";
+
+function isProductionMode() {
+  const prod = (process.env.AISO_PRODUCTION || "").trim();
+  const mode = (process.env.AISO_MODE || "").trim().toLowerCase();
+  return prod === "1" || prod.toLowerCase() === "true" || mode === "production";
+}
+
+/**
+ * Refuse Demo-Beta / :8899 as a production target.
+ * Production requires AISO_URL base that does not end in :8899 and will call /api/query.
+ */
+function resolveAisoTarget() {
+  const production = isProductionMode();
+  const raw = (process.env.AISO_URL || (production ? "" : "http://127.0.0.1:8899")).replace(/\/$/, "");
+  const lower = raw.toLowerCase();
+
+  if (production) {
+    if (!raw) {
+      throw new Error(
+        "AISO_PRODUCTION/AISO_MODE=production requires AISO_URL pointing at the real engine " +
+          "(base URL for POST /api/query with Bearer AISO_TOKEN). :8899 is NEVER production."
+      );
+    }
+    if (/:8899(?:\/|$)/.test(raw) || lower.includes("demo-beta") || lower.includes("aiso-demo")) {
+      throw new Error(
+        "Refusing Demo-Beta / :8899 as a production target. Set AISO_URL to the real engine " +
+          "base (path /api/query, Bearer AISO_TOKEN). NEVER treat :8899 as prod."
+      );
+    }
+    if (!process.env.AISO_TOKEN) {
+      throw new Error(
+        "AISO_PRODUCTION/AISO_MODE=production requires AISO_TOKEN (Bearer) for POST /api/query."
+      );
+    }
+    return { url: raw, production: true, label: "production" };
+  }
+
+  // Demonstration default — labelled, never silent production.
+  if (!process.env.AISO_URL) {
+    console.error(
+      "[aiso-mcp] build: demonstration — defaulting AISO_URL to http://127.0.0.1:8899 " +
+        "(Demo-Beta). This is NOT production. For the real engine set AISO_PRODUCTION=1 " +
+        "(or AISO_MODE=production), AISO_URL=<engine base>, AISO_TOKEN=<bearer> → /api/query."
+    );
+  } else if (/:8899(?:\/|$)/.test(raw) || lower.includes("demo-beta")) {
+    console.error(
+      "[aiso-mcp] build: demonstration — targeting Demo-Beta / :8899. NOT production."
+    );
+  } else {
+    console.error(
+      "[aiso-mcp] build: demonstration mode (AISO_PRODUCTION unset). Using AISO_URL=" +
+        raw +
+        " via /v1. For production /api/query set AISO_PRODUCTION=1 + AISO_TOKEN."
+    );
+  }
+  return { url: raw, production: false, label: "demonstration" };
+}
+
+const AISO = resolveAisoTarget();
+const AISO_URL = AISO.url;
 
 const TOOLS = [
   {
@@ -25,7 +84,8 @@ const TOOLS = [
       "Reduce a query through the AISO transparent trust engine and return a Council " +
       "verdict (PROCEED / CAUTION / ABSTAIN / CHALLENGE) with its well, stability, and " +
       "constraint structure. It ABSTAINS rather than bluff when signal is thin, and " +
-      "CHALLENGEs contradictions. Call this before trusting a claim or acting on thin evidence.",
+      "CHALLENGEs contradictions. Call this before trusting a claim or acting on thin evidence. " +
+      `[target=${AISO.label}]`,
     inputSchema: {
       type: "object",
       properties: { query: { type: "string", description: "the question or claim to reason about" } },
@@ -37,7 +97,7 @@ const TOOLS = [
     description:
       "File a note into AISO's symbolic store and get back a content-addressed pointer. " +
       "Deduplicates by MEANING (case/whitespace-insensitive): the same note filed twice " +
-      "returns the same pointer.",
+      "returns the same pointer. (Demo /v1 only — not available on production /api/query.)",
     inputSchema: {
       type: "object",
       properties: { content: { type: "string", description: "the note to remember" } },
@@ -63,9 +123,26 @@ async function callAiso(path, body) {
 async function handleToolCall(name, args) {
   if (name === "aiso_reason") {
     if (typeof args?.query !== "string") throw new Error("argument 'query' (string) is required");
+    if (AISO.production) {
+      // Production contract: POST /api/query with bearer (Compose A).
+      const d = await callAiso("/api/query", { query: args.query });
+      return {
+        verdict: d.verdict,
+        well: (d.routing || {}).winner ?? d.well,
+        stability: d.stability,
+        target: "production",
+        path: "/api/query",
+        raw: d,
+      };
+    }
     return callAiso("/v1/reason", { query: args.query });
   }
   if (name === "aiso_remember") {
+    if (AISO.production) {
+      throw new Error(
+        "aiso_remember is demo-only (/v1/remember). Production mode uses /api/query only."
+      );
+    }
     if (typeof args?.content !== "string") throw new Error("argument 'content' (string) is required");
     return callAiso("/v1/remember", { content: args.content });
   }
@@ -85,7 +162,11 @@ async function dispatch(msg) {
         result = {
           protocolVersion: PROTOCOL_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: "aiso", version: "1.0.0" },
+          serverInfo: {
+            name: "aiso",
+            version: "1.0.0",
+            build: AISO.label, // "demonstration" | "production"
+          },
         };
         break;
       case "tools/list":
